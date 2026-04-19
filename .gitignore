@@ -1,0 +1,32 @@
+# 提示词目录
+prompts/
+
+# Python缓存文件
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# 输出数据文件（生成的结果文件）
+outputs/
+*.npz
+
+# 模型缓存文件
+*.eng
+
+# 虚拟环境
+venv/
+env/
+ENV/
+
+# IDE配置
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
