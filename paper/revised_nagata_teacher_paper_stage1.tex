@@ -1,0 +1,703 @@
+
+\documentclass[12pt,oneside]{ctexbook}
+\usepackage[a4paper,margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb,amsfonts,bm,mathtools}
+\usepackage{booktabs,multirow,array}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{caption}
+\usepackage{setspace}
+\usepackage{titlesec}
+\usepackage{xcolor}
+\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
+\setstretch{1.2}
+\titleformat{\chapter}{\centering\zihao{3}\bfseries}{第\thechapter 章}{1em}{}
+
+\title{基于增强 Nagata 曲面三角形与 GPU 窄带查询的高精度数值教师场生成方法}
+\author{作者姓名}
+\date{\today}
+
+\begin{document}
+\frontmatter
+\maketitle
+
+\chapter*{摘要}
+符号距离场（Signed Distance Field, SDF）是几何处理、接触检测、水平集方法、优化求解与隐式建模中的核心基础表示。对于齿轮、叶轮、壳体等具有折痕、尖锐边和法向跨边不连续特征的工程对象，直接基于平面三角形构造距离场虽然简单，但只能对分片线性网格自身精确；而若直接对相邻三角形分别按普通 Nagata 曲面独立延拓，则在裂隙边附近容易出现边界曲线不一致、局部翻转与越界，从而污染教师距离、法向与符号监督。
+
+本文当前稿件重点完成并验证了以下内容：
+（1）增强 Nagata 曲面三角形教师几何构造方法，通过裂隙边检测、共享边界系数构造、Jacobian 正性与边界同侧约束，建立边界一致、局部无翻转、不过界的分片曲面系统；
+（2）基于该增强曲面集合的高阶稀疏窄带数值教师场生成与 CPU+GPU 混合实现；
+（3）以解析球体模型为参考，对教师场进行高精度数值逼近验证，实验表明平均绝对误差约为 $5.39\times10^{-5}$，误差主因是教师曲面对解析球的非零几何逼近误差，GPU 实现差异不是主导因素；
+（4）以含 128 条折痕边的 cone 模型为对象，验证了增强路径的实际触发与输出数值自洽性。
+
+在此基础上，本文第三章给出了面向稀疏窄带的神经蒸馏加速扩展框架设计，作为后续学生场加速方向，但当前稿件尚未完成其完整实验闭环，该部分应理解为方法设计与后续扩展方向。
+\tableofcontents
+
+\mainmatter
+
+\chapter{引言与论文结构}
+\section{研究背景}
+符号距离场通过对空间点到目标曲面的最近距离赋予内外符号，提供了一种统一处理几何、拓扑与局部法向信息的隐式表示。对于接触检测、碰撞响应、水平集演化、布尔运算、可微优化与形状重建等问题，SDF 既可以作为几何查询工具，也可以作为后续数值算法的基础场函数。工程模型中常见的齿轮、叶轮、壳体与叶片等零件往往包含大量折痕、尖锐边和法向突变，其底层几何特征并不满足"处处光滑且跨边法向连续"的假设。
+
+传统基于平面三角形的 SDF 构造方法可以精确处理分片线性网格，但难以表达局部曲率与高阶法向变化。若进一步采用普通 Nagata 曲面对每个三角形独立进行二次插值，虽然能够提升单片内部的平滑性，但在法向跨边不连续区域，两侧曲面片会因为使用各自单侧法向而给出不一致的共享边界，由此产生裂隙、重叠、局部翻转与越界。对于教师场生成而言，这些问题比"是否足够光滑"更严重，因为它们会直接破坏最近点、符号和梯度监督的一致性。
+
+\section{问题陈述}
+本文关注如下问题：给定一组三角网格拓扑、一致定向的顶点法向以及包含折痕和尖锐边的闭合模型，如何构造一个既能保留 Nagata 曲面高阶几何优势、又能在法向不连续边上避免裂隙、翻转和越界的增强曲面三角形系统，并进一步基于该系统生成高精度稀疏窄带 SDF 教师场，在保持几何正确性的前提下显著降低重复查询成本。
+
+该问题包含三个层面的挑战。第一，如何为存在法向跳变的共享边定义统一且合法的曲面边界，使得两侧三角形不再各自给出互相冲突的边界曲线。第二，如何在曲面求值过程中抑制局部翻转与边界越界，保证增强曲面在非光滑区域仍可作为教师几何。第三，如何将该增强曲面系统高效转化为窄带教师场，并进一步蒸馏为适合重复查询的神经学生场。
+
+\section{本文思路}
+围绕上述问题，本文当前稿件聚焦于教师场阶段，并给出后续学生层扩展框架。其核心思想如下。
+
+首先，不再将普通 Nagata 曲面直接作为教师几何，而是在检测折痕边之后，为问题边构造共享边界系数，并在系数筛选和曲面求值两个层面施加 Jacobian 正性与边界同侧约束。由此，增强项不是对正确曲面的附加修补，而是非光滑边情形下使曲面定义成立的必要组成。
+
+其次，以增强 Nagata 曲面三角形系统作为教师曲面后端，仅在活跃窄带区域生成高质量教师样本。对每个空间点，通过候选片筛选、局部最近点投影、边界兜底与法向判号得到教师距离值和可选梯度监督。
+
+最后，将该高精度窄带教师场蒸馏为一组仅覆盖活跃窄带区域的局部神经表示。神经网络在本文中不负责定义几何真值，而是负责快速逼近已知教师场，将昂贵的增强曲面查询转化为局部特征访问与小型网络前向传播。该蒸馏框架作为后续扩展方向，当前稿件尚未完成其完整实验验证。
+
+\section{主要贡献}
+本文的主要贡献体现在以下"2+1"结构中。
+
+（1）提出一套面向折痕和法向不连续边的增强 Nagata 曲面三角形构造方法。该方法通过裂隙边检测、共享边界系数构造、约束筛选及求值阶段保护，在允许跨边法向不连续的前提下建立边界一致、局部无翻转、不过界的分片曲面系统。
+
+（2）提出一套基于增强 Nagata 曲面三角形的高阶稀疏窄带 SDF 数值教师场生成与 GPU 窄带查询实现。该方法通过局部最近点投影、边界兜底、曲面法向判号与全局定向修正，在近表面区域构造与增强曲面几何一致的符号距离值，并以 CPU 预处理 + GPU 批量查询的混合后端实现高效大规模查询。
+
+（3）给出面向稀疏窄带的学生场蒸馏扩展框架设计，以增强 Nagata 教师场为监督，在活跃窄带区域建立局部神经隐式表示，并通过共享解码器实现窄带 SDF 的快速查询。该框架的完整实验验证留待后续工作，当前稿件尚未完成其训练、推理与回退机制的实证闭环。
+
+\section{论文组织结构}
+本文第二章和第五章构成当前稿件的主要实证部分；第三章给出后续学生场方向的设计框架；第四章保留为完整实验计划与评价标准。具体如下：
+
+第二章给出增强 Nagata 曲面三角形的生成算法，以及基于该曲面系统的高阶稀疏窄带符号距离场教师构造方法，是全文的几何教师部分；
+
+第三章在第二章基础上，给出基于增强 Nagata 教师场蒸馏的稀疏窄带神经符号距离场快速生成方法框架设计，是后续学生层加速方向；
+
+第四章构建完整实验设计与对比方法计划，其中当前稿件已完成教师场阶段的部分结果，学生层与完整链条对比将按该协议继续补充；
+
+第五章总结当前阶段的实验结果；
+
+第六章总结全文并讨论局限性与未来工作。
+
+\chapter{基于增强 Nagata 曲面三角形的高阶稀疏窄带符号距离场生成方法}
+\section{问题定义}
+设输入为一组三角形网格单元及其顶点法向，三角形集合记为
+\[
+\mathcal{T}=\{T_i\}_{i=1}^{M},
+\]
+每个三角形单元在参数域
+\[
+\Delta=\{(u,v)\mid u\ge 0,\ v\ge 0,\ u+v\le 1\}
+\]
+上对应一个 Nagata 曲面三角形片。以顶点位置 $x_{00},x_{10},x_{11}\in\mathbb R^3$ 及三条边对应的二次系数 $c_1,c_2,c_3\in\mathbb R^3$ 表示，则原始 Nagata 曲面写为
+\[
+S_i^{\mathrm{raw}}(u,v)=x_{00}(1-u)+x_{10}(u-v)+x_{11}v-c_1(1-u)(u-v)-c_2(u-v)v-c_3(1-u)v.
+\]
+
+当相邻三角形跨共享边存在法向不连续时，直接使用 $S_i^{\mathrm{raw}}$ 会在折痕边附近造成边界曲线不一致、局部翻转和越界。本文因此为问题边构造增强曲面三角形系统
+\[
+\mathcal{P}^{\mathrm{enh}}=\{\mathcal P_i^{\mathrm{enh}}\}_{i=1}^{M},
+\]
+并在背景域 $\Omega\subset\mathbb R^3$ 上生成窄带有符号距离教师场
+\[
+\phi^\star_\tau:\Omega_\tau\rightarrow[-\tau,\tau],
+\qquad
+\Omega_\tau=\{x\in\Omega: |\phi^\star(x)|\le \tau\},
+\]
+其中 $\tau>0$ 为给定窄带半宽。
+
+\section{增强 Nagata 曲面三角形模型}
+\subsection{原始 Nagata 曲面及其法向}
+对任一曲面片，切向量记为
+\[
+S_{i,u}=\partial_u S_i,\qquad S_{i,v}=\partial_v S_i.
+\]
+其法向向量定义为
+\[
+\mathbf n_i(u,v)=S_{i,u}(u,v)\times S_{i,v}(u,v),
+\]
+单位法向写为
+\[
+\hat n_i(u,v)=\frac{\mathbf n_i(u,v)}{\|\mathbf n_i(u,v)\|}.
+\]
+若 $\|\mathbf n_i\|$ 过小，则使用三角形顶点叉积法向或顶点法向平均作为回退法向，以保证法向估计稳定。
+
+\subsection{增强项的必要性}
+对于折痕边、尖锐边或法向跨边不连续区域，两侧节点法向本就不应一致。若仍对相邻三角形分别依据各自单侧法向独立构造原始 Nagata 曲面，并将其直接拼接为统一曲面，则共享边处会出现边界曲线不一致、局部翻转以及越界等问题。因此，本文不将增强项视为对正确曲面的附加修补，而是将其视为折痕边情形下曲面定义成立的必要组成。
+
+\subsection{增强曲面表达}
+记三条边中与裂隙边集合相关的边索引为 $m\in\mathcal E_i^{\mathrm{cr}}\subseteq\{1,2,3\}$。对每条问题边，首先构造共享边界系数 $c_m^{\sharp}$；随后在片内通过到该边的参数距离 $d_m(u,v)$ 定义高斯型权重
+\[
+w_m(u,v)=\exp\big(-k\,d_m(u,v)^2\big),
+\]
+其中 $k>0$ 为衰减控制系数。于是增强系数写为
+\[
+c_m^{\mathrm{eff}}(u,v)=
+\begin{cases}
+c_m^{\mathrm{orig}}+w_m(u,v)\big(c_m^{\sharp}-c_m^{\mathrm{orig}}\big), & m\in\mathcal E_i^{\mathrm{cr}},\\
+c_m^{\mathrm{orig}}, & m\notin\mathcal E_i^{\mathrm{cr}}.
+\end{cases}
+\]
+将 $c_m^{\mathrm{eff}}$ 代入 Nagata 参数式，得到增强曲面原始求值
+\[
+S_i^{\mathrm{enh,raw}}(u,v)=S_i\big(u,v;c_1^{\mathrm{eff}}(u,v),c_2^{\mathrm{eff}}(u,v),c_3^{\mathrm{eff}}(u,v)\big).
+\]
+
+\section{裂隙边检测与共享边界系数构造}
+\subsection{裂隙边检测}
+对于任一由左右两三角形共享的内部边 $e=(a,b)$，分别使用左右两侧的顶点法向构造各自的原始 Nagata 边界曲线，并在若干参数点 $t\in[0,1]$ 上比较两条边界曲线偏差。若最大偏差超过阈值 $\eta_{\mathrm{gap}}$，则该共享边被标记为裂隙边，记入集合 $\mathcal E^{\mathrm{cr}}$。
+
+\subsection{共享边界系数构造}
+对于每条裂隙边，利用左右两侧法向计算折痕方向，并通过最小二乘求得端点切向长度，从而构造共享二次边界系数 $c^{\sharp}$。其目标不是使两侧法向强行连续，而是在保留折痕特征的前提下，使共享边界曲线本身一致，消除由双侧独立延拓造成的几何缝隙。
+
+\subsection{系数层约束筛选}
+为防止候选 $c^{\sharp}$ 在两侧三角形内部引起局部翻转或越界，本文以左右原始系数均值 $c^{\mathrm{base}}$ 为安全基线，将候选系数写为
+\[
+c(\alpha)=c^{\mathrm{base}}+\alpha\big(c^{\sharp}-c^{\mathrm{base}}\big),\qquad \alpha\in[0,1].
+\]
+随后在边附近选取采样点，对左右两侧分别检查如下两类约束。
+
+第一，Jacobian 正性约束：
+\[
+J(u,v)=\big(\partial_u S_i\times \partial_v S_i\big)\cdot n_{\mathrm{ref}}>0.
+\]
+第二，边界同侧约束：
+\[
+\big(S_i(u,v)-x_{\mathrm{edge}}(t)\big)\cdot n_{\mathrm{side}}\ge -\varepsilon.
+\]
+其中 $x_{\mathrm{edge}}(t)$ 为共享边界曲线，$n_{\mathrm{side}}$ 为由参考法向与边向量构造的边界侧向单位向量，$\varepsilon>0$ 为数值容差。通过二分搜索取得同时满足两侧约束的最大 $\alpha^\star$，并将
+\[
+c^{\sharp}\leftarrow c(\alpha^\star)
+\]
+作为最终共享边界系数。
+
+\section{约束增强求值与解析导数}
+\subsection{求值阶段保护}
+对任一参数点 $(u,v)$，首先计算增强原始值 $S_i^{\mathrm{enh,raw}}(u,v)$ 及其解析偏导。若 Jacobian 正性判据失败，则回退到对应的原始 Nagata 曲面值；若边界同侧判据失败，则沿 $n_{\mathrm{side}}$ 将点投影回合法一侧。因而最终增强曲面定义为
+\[
+S_i^{\mathrm{enh}}(u,v)=\Pi_{\mathrm{side}}\Big(\Pi_{J}\big(S_i^{\mathrm{enh,raw}}(u,v)\big)\Big),
+\]
+其中 $\Pi_J$ 表示 Jacobian 失败时回退到原始曲面，$\Pi_{\mathrm{side}}$ 表示同侧投影修正。按照本文定义，这一带保护的求值结果即为最终正确曲面，而非对正确曲面的额外扰动。
+
+\subsection{边界同侧投影的导数修正}
+设未经投影的曲面点为 $x^{\mathrm{raw}}$，共享边参考点为 $x_{\mathrm{edge}}$，并定义
+\[
+s=(x^{\mathrm{raw}}-x_{\mathrm{edge}})\cdot n_{\mathrm{side}}.
+\]
+当 $s\ge -\varepsilon$ 时，不触发投影；当 $s< -\varepsilon$ 时，投影修正为
+\[
+x^{\mathrm{new}}=x^{\mathrm{raw}}-s\,n_{\mathrm{side}}.
+\]
+由于 $n_{\mathrm{side}}$ 与 $(u,v)$ 无关，投影触发时有
+\[
+\partial_u x^{\mathrm{new}}=\partial_u x^{\mathrm{raw}}-(\partial_u s)\,n_{\mathrm{side}},
+\qquad
+\partial_v x^{\mathrm{new}}=\partial_v x^{\mathrm{raw}}-(\partial_v s)\,n_{\mathrm{side}}.
+\]
+若未触发投影或 Jacobian 检查失败而回退到原始曲面，则偏导保持为相应曲面的解析导数。该设计使增强曲面不仅给出位置值，也能为后续法向估计与梯度监督提供一致的一阶导数信息。
+
+\section{基于增强 Nagata 曲面的局部最近点与符号判定}
+\subsection{局部最近点投影模型}
+对于任一查询点 $x\in\Omega$ 和任一增强曲面片 $\mathcal P_i^{\mathrm{enh}}$，定义局部目标函数
+\[
+F_i(u,v)=\frac{1}{2}\|S_i^{\mathrm{enh}}(u,v)-x\|^2.
+\]
+局部最优解
+\[
+(u_i^\star,v_i^\star)=\arg\min_{(u,v)\in\Delta}F_i(u,v)
+\]
+给出点 $x$ 到第 $i$ 个增强曲面片的最近点
+\[
+y_i^\star=S_i^{\mathrm{enh}}(u_i^\star,v_i^\star),
+\qquad
+d_i(x)=\|x-y_i^\star\|.
+\]
+
+若最优点位于参数域内部，则满足正交条件
+\[
+\big(S_i^{\mathrm{enh}}-x\big)\cdot S_{i,u}^{\mathrm{enh}}=0,
+\qquad
+\big(S_i^{\mathrm{enh}}-x\big)\cdot S_{i,v}^{\mathrm{enh}}=0.
+\]
+记 $r=S_i^{\mathrm{enh}}-x$，则梯度可写为
+\[
+g=
+\begin{bmatrix}
+r\cdot S_{i,u}^{\mathrm{enh}}\\
+r\cdot S_{i,v}^{\mathrm{enh}}
+\end{bmatrix}.
+\]
+对应 Hessian 使用增强曲面的二阶导数或其 Gauss--Newton 近似构造，并通过阻尼 Newton 迭代求解参数增量。当迭代越界或最优点落在边界上时，退化为三条边界曲线上的一维最近点问题求解；最终在内点候选和边界候选中选取最小距离。
+
+\subsection{全局最近点与无符号距离}
+对每个候选增强曲面片重复局部最近点求解，取全局最小者：
+\[
+d^\star(x)=\min_{1\le i\le M}d_i(x).
+\]
+若达到最小值的曲面片索引为 $i^\star$，则
+\[
+y^\star(x)=y_{i^\star}^\star,
+\qquad
+d^\star(x)=\|x-y^\star(x)\|.
+\]
+在窄带内，$d^\star(x)$ 即为增强 Nagata 教师的无符号距离值。
+
+\subsection{局部符号判定与全局定向修正}
+设最近点参数为 $(u^\star,v^\star)$，则最近点处法向定义为
+\[
+n^\star(x)=
+\frac{S_{i^\star,u}^{\mathrm{enh}}(u^\star,v^\star)\times S_{i^\star,v}^{\mathrm{enh}}(u^\star,v^\star)}{\left\|S_{i^\star,u}^{\mathrm{enh}}(u^\star,v^\star)\times S_{i^\star,v}^{\mathrm{enh}}(u^\star,v^\star)\right\|}.
+\]
+于是局部符号可定义为
+\[
+s_{\mathrm{loc}}(x)=\operatorname{sign}\Big((x-y^\star(x))\cdot n^\star(x)\Big).
+\]
+若模型整体具有一致定向，则在窄带内部可直接采用该局部符号；若需要更强鲁棒性，则可引入射线奇偶性或绕数等全局 inside/outside 修正，得到最终教师场
+\[
+\phi^\star(x)=s_{\mathrm{glob}}(x)\,d^\star(x),
+\qquad
+\phi^\star_\tau(x)=\mathrm{clip}(\phi^\star(x),-\tau,\tau).
+\]
+
+\section{稀疏窄带激活与教师场生成流程}
+为了避免对整个背景域暴力求解，本文仅对与增强曲面片邻近的背景块进行激活。对每个增强曲面片 $\mathcal P_i^{\mathrm{enh}}$，构造其轴对齐包围盒 $B_i$，并以带宽 $\tau$ 做膨胀得到 $\widetilde B_i$。若某个背景块与某个 $\widetilde B_i$ 相交，则该块被标记为活跃块。记所有活跃背景块构成集合 $\mathcal B_{\mathrm{act}}$。
+
+在此基础上，教师场生成流程如下：
+\begin{enumerate}[label=\arabic*)]
+  \item 对输入网格执行裂隙边检测，得到问题边集合 $\mathcal E^{\mathrm{cr}}$；
+  \item 对每条问题边计算共享边界系数，并完成 Jacobian 正性与边界同侧约束筛选；
+  \item 为每个三角形构造增强 Nagata 曲面片，预处理包围盒、边界曲线和导数信息；
+  \item 激活窄带背景块，并建立块到候选曲面片的索引；
+  \item 对每个活跃采样点执行局部最近点投影与边界兜底，得到最近点和无符号距离；
+  \item 基于增强曲面法向和全局定向给出符号，生成截断窄带教师场 $\phi^\star_\tau$；
+  \item 将结果存储为稀疏窄带教师样本，供后续神经蒸馏使用。
+\end{enumerate}
+
+\section{教师场正确性与性能分析}
+\subsection{正确性说明}
+本文将增强 Nagata 曲面三角形视为当前数值教师几何模型。在给定共享边界系数筛选、局部最近点求解与定向修正均有效的前提下，可在带宽 $\tau$ 内构造与该增强曲面系统几何一致的高精度数值窄带教师场。需要强调的是，该教师场的"正确性"应理解为相对于增强 Nagata 教师几何模型的一致性，而非对任意解析目标曲面的严格解析真值一致性。
+
+\subsection{性能分析}
+增强 Nagata 教师场的计算成本由两部分组成。
+
+第一部分为一次性预处理成本，包括裂隙边检测、共享边界系数计算、系数层约束筛选以及增强曲面片导数和包围盒预处理。若内部共享边数为 $N_e$，每条边检测采样数为 $K_d$，约束筛选采样数为 $K_c$，二分或缩放迭代步数为 $I_c$，则预处理成本可近似写为
+\[
+T_{\mathrm{pre}}=O\big(N_eK_d+N_eK_cI_c\big).
+\]
+
+第二部分为教师查询成本。设窄带样本数为 $N_s$，每个样本平均候选片数为 $\bar C$，每个候选片最近点求解平均迭代步数为 $I_{cp}$，单次增强曲面评估成本为 $C_{\mathrm{enh}}$，则教师求值总代价近似为
+\[
+T_{\mathrm{teacher}}=O\big(N_s\,\bar C\,I_{cp}\,C_{\mathrm{enh}}\big).
+\]
+其中 $C_{\mathrm{enh}}$ 相比普通平面三角形距离查询更大，相比原始 Nagata 曲面也会增加边查询、有效系数计算、Jacobian 检查与同侧投影等常数项；但其复杂度数量级并未改变。实际系统中，主导瓶颈通常仍是最近点搜索，而不是增强逻辑本身。因此，该教师更适合作为离线高质量窄带监督生成器，并与后续神经学生场配合使用，而不是直接承担大规模重复在线查询。
+
+\chapter{基于增强 Nagata 教师场蒸馏的稀疏窄带神经符号距离场快速生成方法}
+
+本章给出基于增强 Nagata 教师场的学生层蒸馏框架设计。由于当前阶段的实验工作主要集中于第二章教师场构造及其 GPU 实现，第五章尚未给出完整的学生训练、推理和回退机制实验结果。因此，本章内容应理解为后续扩展方向与方法设计，而非已完成闭环验证的实证部分。
+
+\section{方法动机}
+第二章方法可以生成几何意义明确且适用于非光滑边对象的高精度窄带教师场，但其核心操作是重复的增强曲面查询。对每个采样点，都需要执行候选曲面片筛选、局部最近点优化和边界兜底判断；在增强曲面评估内部，还需要完成裂隙边查找、有效系数计算、Jacobian 正性检查以及边界同侧保护。当模型复杂、窄带采样密度高或同一几何对象需要被反复查询时，教师求值将成为主要瓶颈。
+
+本章的目标不是重新定义几何真值，而是在已知增强 Nagata 教师场的前提下，学习一个只覆盖活跃窄带的快速学生表示。该学生表示在训练时接受教师场监督，在推理时以局部特征访问和小型网络前向传播替代昂贵的增强曲面查询，从而实现窄带场的快速查询和压缩存储。
+
+\section{问题定义}
+设第二章已生成教师窄带场
+\[
+\phi^\star_\tau:\Omega_\tau\to[-\tau,\tau].
+\]
+本文希望构造神经学生场
+\[
+\hat\phi_\theta:\Omega_\tau\to[-\tau,\tau],
+\]
+使其满足
+\[
+\hat\phi_\theta(x)\approx \phi^\star_\tau(x),\qquad x\in\Omega_\tau,
+\]
+并尽可能保持教师场在零水平附近的法向与梯度性质。学生场仅在活跃窄带块上有定义；远场区域不参与表示，也不参与训练。
+
+\section{稀疏局部表示}
+对第二章得到的活跃背景块集合 $\mathcal B_{\mathrm{act}}$，本文仅为其中的每个块 $B_k$ 分配局部参数。设块级局部坐标映射为
+\[
+\xi=T_k(x)\in[-1,1]^3,
+\qquad x\in B_k.
+\]
+本文考虑两类兼容实现。
+
+第一类实现为块级潜变量表示：为每个活跃块分配潜变量
+\[
+z_k\in\mathbb R^{d_z},
+\]
+并通过共享解码器给出
+\[
+\hat\phi_\theta(x)=f_\theta(\xi,z_k).
+\]
+
+第二类实现为多分辨率哈希编码表示：通过若干层局部哈希表插值得到编码
+\[
+h(x)\in\mathbb R^{d_h},
+\]
+再经共享小型 MLP 输出
+\[
+\hat\phi_\theta(x)=f_\theta(h(x)).
+\]
+两种实现本质上都属于"局部特征 + 共享解码器"的结构，只是前者更强调块级稀疏性，后者更强调高吞吐与编码效率。
+
+\section{残差式学生场}
+直接学习完整窄带 SDF 通常较难，因此本文采用残差式学生场。给定一个便宜的粗场
+\[
+\phi_{\mathrm{coarse}}(x),
+\]
+例如由线性三角形粗距离、普通 Nagata 曲面粗距离或低精度窄带场生成，则学生网络只学习教师相对粗场的修正项：
+\[
+\hat\phi_\theta(x)=\phi_{\mathrm{coarse}}(x)+r_\theta(x).
+\]
+相应监督目标为
+\[
+r^\star(x)=\phi^\star_\tau(x)-\phi_{\mathrm{coarse}}(x).
+\]
+这样，网络回归的不是整个距离场，而是较小幅值的局部残差，可显著降低学习难度。对于齿轮、叶片等具有重复局部几何结构的对象，该设计尤其有利。
+
+\section{训练样本生成}
+训练样本由第二章增强 Nagata 教师自动生成。设样本集合为
+\[
+\mathcal S=\{x_j\}_{j=1}^{N_s}.
+\]
+本文计划采用四类样本：
+\begin{enumerate}[label=\arabic*)]
+  \item 曲面近邻样本：从增强曲面点沿法向正负扰动，形成零水平附近的高密度样本；
+  \item 活跃块内部样本：在每个活跃块中均匀采样，用于约束块内部整体场形状；
+  \item 折痕边增强样本：对裂隙边、尖锐边和法向不连续边邻域额外增加采样密度，用于强化学生对增强几何的学习；
+  \item 高风险样本：在 Jacobian 变化剧烈区、边界同侧保护易触发区和多片竞争最近点区额外采样，以提高困难区域的逼近稳定性。
+\end{enumerate}
+对每个样本点，教师求值器给出
+\[
+\phi^\star_\tau(x_j)
+\]
+以及可选的梯度监督
+\[
+g^\star(x_j)=\nabla\phi^\star(x_j).
+\]
+当最近点唯一且局部法向稳定时，$g^\star$ 可由最近点处增强曲面法向给出；在多片竞争或符号不稳定区域，可仅使用值监督，避免向学生注入含糊梯度。
+
+\section{训练目标}
+若后续完成训练，本文计划采用值监督、梯度监督与零水平约束组合的训练目标。记学生输出为 $\hat\phi_\theta(x)$，则总损失设计为
+\[
+L=\lambda_d L_d+\lambda_g L_g+\lambda_0 L_0+\lambda_r L_r.
+\]
+其中，距离值损失设计为
+\[
+L_d=\frac{1}{N_s}\sum_{j=1}^{N_s}\left|\hat\phi_\theta(x_j)-\phi^\star_\tau(x_j)\right|,
+\]
+梯度损失设计为
+\[
+L_g=\frac{1}{N_s}\sum_{j=1}^{N_s}\left\|\nabla\hat\phi_\theta(x_j)-g^\star(x_j)\right\|_1,
+\]
+零水平约束设计为
+\[
+L_0=\frac{1}{N_0}\sum_{x_s\in\Sigma}\left|\hat\phi_\theta(x_s)\right|.
+\]
+正则项 $L_r$ 用于限制局部特征和网络参数规模，提升训练稳定性。理论上，该设计不以全域 eikonal 约束作为主要训练目标，而以增强 Nagata 教师监督为主，以避免训练容量浪费和过强正则带来的不稳定性。
+
+\section{推理与回退机制}
+若后续完成训练，推理阶段对任意查询点 $x\in\Omega_\tau$ 的处理流程设计为：确定其所属活跃块，读取局部特征或哈希编码，经过共享解码器得到 $\hat\phi_\theta(x)$。该过程仅包含局部特征访问和小型神经网络前向传播，因此理论上较第二章的增强教师求值大幅提速。
+
+为了兼顾可靠性，本文可选地引入教师回退机制。记块级或点级置信指标为 $\omega(x)$。若
+\[
+\omega(x)<\omega_{\min},
+\]
+则认为该点位于高风险区域，此时回退到第二章增强教师求值器，采用精确方法返回 $\phi^\star_\tau(x)$。因此最终系统输出设计为
+\[
+\tilde\phi(x)=
+\begin{cases}
+\hat\phi_\theta(x), & \omega(x)\ge \omega_{\min},\\
+\phi^\star_\tau(x), & \omega(x)<\omega_{\min}.
+\end{cases}
+\]
+在这一机制下，大部分常规点由学生快速处理，少量高风险点则由教师兜底，该设计预期可兼顾吞吐量与准确性。
+
+\section{误差分解}
+设增强 Nagata 教师场相对于目标窄带 SDF 的误差满足
+\[
+\|\phi^\star_\tau-\phi_\tau\|_{L^\infty(\Omega_\tau)}\le \varepsilon_T,
+\]
+学生对教师的逼近误差满足
+\[
+\|\hat\phi_\theta-\phi^\star_\tau\|_{L^\infty(\Omega_\tau)}\le \varepsilon_N.
+\]
+则有
+\[
+\|\hat\phi_\theta-\phi_\tau\|_{L^\infty(\Omega_\tau)}
+\le
+\varepsilon_T+\varepsilon_N.
+\]
+因此，理论上神经学生场的最终误差由两部分构成：一部分来自增强教师几何误差，另一部分来自学生逼近误差。若后续启用教师回退机制，则高风险点直接使用教师值，该复杂度分析表明实际系统误差可进一步压缩至更小范围。
+
+\section{复杂度分析}
+设教师窄带样本数为 $N_s$，单个教师样本求值成本为 $C_T$，训练轮数为 $E$，单样本训练成本为 $C_{\mathrm{train}}$，学生单次推理成本为 $C_N$，后续总查询次数为 $Q$。
+
+对增强 Nagata 教师而言，单样本求值成本可分解为
+\[
+C_T\approx C_{\mathrm{cand}}+\bar C\,I_{cp}\,C_{\mathrm{enh}}+C_{\mathrm{sign}},
+\]
+其中 $C_{\mathrm{cand}}$ 为候选片检索成本，$\bar C$ 为平均候选片数，$I_{cp}$ 为最近点迭代步数，$C_{\mathrm{enh}}$ 为单次增强曲面评估成本，$C_{\mathrm{sign}}$ 为法向与符号判定成本。于是纯教师重复查询总代价近似为
+\[
+T_{\mathrm{direct}}\approx Q\,C_T.
+\]
+神经蒸馏方案总代价近似为
+\[
+T_{\mathrm{student}}\approx T_{\mathrm{pre}}+N_s C_T + E N_s C_{\mathrm{train}} + Q C_N.
+\]
+理论上，当后续查询规模满足
+\[
+Q(C_T-C_N)\gg T_{\mathrm{pre}}+N_s C_T + E N_s C_{\mathrm{train}},
+\]
+时，神经蒸馏方案在总时间上优于纯教师方案。该复杂度分析表明，这一设计预期适用于"增强教师昂贵、但查询需求高度重复"的场景。
+
+\chapter{实验设计与对比方法}
+\section{实验目标}
+本文实验目标分为两层。
+
+当前阶段已完成的目标：
+\begin{enumerate}[label=\arabic*)]
+  \item 验证第二章增强 Nagata 教师方法是否能够在稀疏窄带内生成高精度、几何一致的符号距离场；
+  \item 验证 CPU 预处理 + GPU 批量查询混合后端在大规模窄带样本生成场景下的可行性与性能表现。
+\end{enumerate}
+
+完整链条的后续目标：
+\begin{enumerate}[label=\arabic*)]
+  \item 验证第三章学生方法是否能够在保持近场精度的同时显著降低重复查询代价；
+  \item 验证教师与学生两级表示组合后，是否能够在含折痕和尖锐特征的工程对象上体现较好的精度--效率平衡。
+\end{enumerate}
+
+\section{数据集与对象类型}
+实验对象分为两类。第一类为具有解析或高精度参考真值的规则曲面模型，如球面、圆环面、椭球面与样条型参数曲面，用于定量分析距离误差和法向误差。第二类为工程零件模型，如齿轮、叶轮、壳体和具有复杂曲率分布及折痕边的封闭曲面对象，用于验证方法在增强 Nagata 曲面教师和重复局部结构条件下的适用性。
+
+对于第二类对象，教师场由增强 Nagata 曲面三角形模型直接生成；学生场则基于该教师场进行训练和测试。若模型没有现成解析距离函数，则通过更高分辨率增强教师求值或高精度参考求解构造近似数值真值。
+
+\section{对比方法}
+实验计划采用以下对比方法：
+\begin{enumerate}[label=\arabic*)]
+  \item \textbf{Linear-Tri SDF}：基于平面三角形的最近点距离与符号判定，是最基础基线；
+  \item \textbf{Raw Nagata SDF}：不含共享边界系数与约束保护的普通 Nagata 曲面教师，用于验证增强项的必要性；
+  \item \textbf{Enhanced Nagata Teacher}：本文第二章增强 Nagata 曲面三角形教师方法；
+  \item \textbf{Student Direct}：第三章中不带回退机制的神经学生方法；
+  \item \textbf{Student + Fallback}：第三章中带教师回退机制的神经学生方法。
+\end{enumerate}
+当前稿件已完成 Enhanced Nagata Teacher 的实证结果；Linear-Tri、Raw Nagata、Student Direct 与 Student + Fallback 的完整对比仍在后续实验计划中。
+
+\section{评价指标}
+设参考真值为 $\phi^{\mathrm{ref}}$，待评估结果为 $\phi$。
+
+距离误差采用平均绝对误差、最大绝对误差和均方根误差：
+\[
+E_{\mathrm{mean}}=\frac{1}{|\mathcal Q|}\sum_{x\in\mathcal Q}|\phi(x)-\phi^{\mathrm{ref}}(x)|,
+\]
+\[
+E_{\max}=\max_{x\in\mathcal Q}|\phi(x)-\phi^{\mathrm{ref}}(x)|,
+\]
+\[
+E_{\mathrm{rms}}=\left(\frac{1}{|\mathcal Q|}\sum_{x\in\mathcal Q}|\phi(x)-\phi^{\mathrm{ref}}(x)|^2\right)^{1/2}.
+\]
+法向误差由归一化梯度与参考法向的夹角给出：
+\[
+e_n(x)=\arccos\big(n_\phi(x)\cdot n^{\mathrm{ref}}(x)\big).
+\]
+同时，统计零水平集重建误差、训练时间、推理时间、平均单点查询代价、模型参数量与峰值内存占用，并附加统计裂隙边附近样本的局部误差，以专门考察增强几何在非光滑区域的表现。
+
+\section{实验协议}
+本节给出完整实验协议，其中当前稿件已完成教师场阶段的部分结果，学生层与完整链条对比将按该协议继续补充。所有方法计划在统一背景网格与统一窄带宽度下比较。对教师方法和学生方法，均采用相同的活跃窄带定义；对学生训练，使用相同的训练/验证/测试划分。推理性能测试分别统计单次查询和批量查询两种模式，并在多线程 CPU 或 GPU 上记录吞吐表现。
+
+\section{消融实验}
+以下列出计划进行的消融实验：
+\begin{enumerate}[label=\arabic*)]
+  \item 去除共享边界系数，直接使用普通 Nagata 曲面；
+  \item 去除 Jacobian 正性约束；
+  \item 去除边界同侧约束；
+  \item 去除折痕边增强采样；
+  \item 去除教师回退机制；
+  \item 使用不同局部特征规模和不同哈希层级配置。
+\end{enumerate}
+通过这些消融实验，可以进一步说明增强曲面构造、采样策略和回退机制对整体误差与效率的影响。
+
+\section{预期结果与讨论重点}
+本文后续将重点验证以下趋势：增强教师方法在折痕边和近表面区域相较线性三角形与普通 Nagata 方法具有更高几何正确性和更稳定的距离监督；学生方法能够在保持增强教师近场精度趋势的同时，大幅降低重复查询成本；教师回退机制能显著减少高风险区域误差。最终，应形成如下完整链条：增强曲面几何确保近场真实性，神经蒸馏负责局部快速近似，而实验结果则验证这两级表示之间的误差传递和效率收益。
+
+
+\chapter{实验结果}
+\section{GPU 教师场实现与性能}
+本文采用 CPU 预处理 + GPU 批量查询的混合后端实现增强 Nagata 教师场生成。
+CPU 负责 NSM/ENG 读取、裂隙边预处理、包围盒计算与活跃块枚举；
+GPU 负责批量增强 Nagata 求值、导数计算、最近点 Newton 迭代与 SDF 输出。
+
+以 Sphere 模型（242 顶点、480 三角形）为例，全量生成规模如下：
+总采样点数 $N_{\mathrm{sampled}}=2,353,024$，
+窄带保留样本 $N_{\mathrm{kept}}=643,072$，
+GPU 查询耗时 $t_{\mathrm{gpu}}=62.15\,\mathrm{s}$，
+总壁钟时间 $t_{\mathrm{total}}=64.52\,\mathrm{s}$。
+
+该结果说明当前实现已能高效生成大规模窄带数值教师样本，但尚不足以单独证明完整教师-学生链条的总体收益。
+
+\section{球体解析验证}
+Sphere 模型具有解析球面 SDF 参考真值 $\phi_{\mathrm{ref}}(x)=\|x-c\|-R$，
+因此可用于直接定量评估教师场精度。表~\ref{tab:sphere_accuracy}
+列出了各项误差指标。
+
+\begin{table}[htbp]
+\centering
+\caption{Sphere 教师场与解析球 SDF 的对比误差}
+\label{tab:sphere_accuracy}
+\begin{tabular}{lc}
+\toprule
+指标 & 值 \\
+\midrule
+Mean Abs. Error & 5.39e-05 \\
+RMSE & 7.93e-05 \\
+P95 Abs. Error & 1.69e-04 \\
+Max Abs. Error & 2.87e-04 \\
+Sign Mismatch Rate & 0.0003 \\
+Nearest Radial Err. Mean & 5.39e-05 \\
+Normal Cosine Mean & 0.99999909 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+当前结果表明教师场在解析球上达到了高精度数值逼近，但非零误差仍然存在。结合误差来源分解实验：
+（1）当前 mean\_abs\_err = $5.39\times10^{-5}$ 与 surface\_radial\_err\_mean = $5.39\times10^{-5}$ 同量级，二者相关系数达 0.9999997，说明误差主因是教师曲面相对解析球的非零几何逼近误差，而非数值计算或 GPU 实现偏差；
+（2）CPU/GPU 在 5000 点子集上的平均绝对差异仅为 $2.25\times10^{-8}$，GPU/CPU 差异不是主导来源；
+（3）Sign mismatch 样本中 91.3\% 集中在 $|\phi_{\mathrm{ref}}|<10^{-4}$ 的零水平集附近，属于近表面数值敏感性引起的局部翻转，不构成全局符号错误。
+
+符号不匹配样本中，91.3\% 集中在 $|\phi_{\mathrm{ref}}|<10^{-4}$ 的零水平集附近，
+100.0\% 集中在 $|\phi_{\mathrm{ref}}|<10^{-3}$ 范围内。
+这表明 sign mismatch 主要由数值敏感区的局部符号翻转引起，不构成全局符号错误。
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.48\textwidth]{../outputs/figures/sphere_error_hist.pdf}
+\caption{Sphere 教师场绝对误差分布（对数 Y 轴）}
+\label{fig:sphere_error_hist}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.6\textwidth]{../outputs/figures/sphere_sign_mismatch_scatter.pdf}
+\caption{Sphere sign mismatch 散点图（按 $|\phi_{\mathrm{ref}}|$ 着色，集中在零水平集附近）}
+\label{fig:sphere_mismatch}
+\end{figure}
+
+\section{锐边模型验证}
+本文使用 \texttt{cone.nsm} 作为含锐边/折痕的工程模型，
+以验证增强 Nagata 曲面三角形在非光滑边场景下的实际价值。
+该模型包含 128 条折痕边，
+实际触发了 enhanced Nagata path。
+
+GPU 教师场生成结果如下：
+保留样本 268,072 个（占比 0.3919），
+总耗时 45.65 s。
+自洽性检查显示 $|\,|{\rm SDF}| - d_{\rm unsigned}\,|$ 的均值为 0.0e+00，
+P95 为 0.0e+00，表明 SDF 符号与无符号距离完全一致。
+
+需要强调的是，本节 cone 模型验证属于锐边模型上的自洽性验证，
+而非解析真值验证。其作用是证明增强路径被实际触发且输出数值自洽。
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.6\textwidth]{../outputs/figures/cone_sample_distribution.pdf}
+\caption{Cone 教师样本点云分布（按 $|{\rm SDF}|$ 着色）}
+\label{fig:cone_samples}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.48\textwidth]{../outputs/figures/cone_feature_code_distribution.pdf}
+\caption{Cone 教师样本 feature code 分布}
+\label{fig:cone_fc}
+\end{figure}
+
+\section{实验汇总表}
+表~\ref{tab:summary} 汇总了当前阶段实验结果。
+
+\begin{table}[htbp]
+\centering
+\caption{当前阶段实验结果汇总}
+\label{tab:summary}
+\begin{tabular}{lcc}
+\toprule
+& Sphere & Cone \\
+\midrule
+Crease Edges & 0 & 128 \\
+Samples Kept & 643,072 & 268,072 \\
+Wall Time (s) & 64.52 & 45.65 \\
+Mean Abs. Error / Self-consistency & 5.39e-05 & self-consistent \\
+Key Conclusion & 解析球高精度逼近 & 锐边模型上自洽且增强路径已触发 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\chapter{结论与展望}
+当前稿件主要完成并验证了增强 Nagata 曲面三角形教师几何、高阶稀疏窄带数值教师场生成以及 CPU+GPU 混合查询实现。实验表明，该方法在解析球上能够达到高精度数值逼近，在含折痕边的 cone 模型上能够真实触发增强路径并保持数值自洽。与此同时，学生层蒸馏框架、完整基线对比及系统性消融仍属于后续工作的重点。
+
+本文方法尤其适用于精确几何已知、折痕特征显著、近场查询频繁且局部几何正确性要求较高的工程对象。与直接使用线性三角形构造 SDF 相比，本文的优势在于更好地保留了曲率信息并显式处理了非光滑边；与直接使用普通 Nagata 曲面作为教师相比，本文的优势在于避免了裂隙、翻转与越界带来的错误监督；与直接用神经网络从零学习隐式场相比，本文方法的优势在于神经网络不再负责定义真值，而是负责加速与压缩教师场，从而具有更强的可解释性与可控性。
+
+需要明确指出的是，当前研究仍存在以下局限性：
+（1）当前 sphere 验证仍有非零误差（mean\_abs\_err = $5.39\times10^{-5}$），说明教师是高精度数值教师而非严格解析真值；
+（2）当前锐边模型主要是自洽性验证，尚缺更复杂工程件上的高精度参考对照；
+（3）当前第三章学生层尚未完成完整实验闭环，训练、推理与回退机制仍需后续实证验证。
+
+未来工作可以沿以下方向展开：其一，进一步研究增强曲面最近点求解的高效数值算法与误差上界；其二，探索块级误差估计与自适应回退策略，从理论上加强学生场的可靠性控制；其三，研究与接触求解、优化迭代和工业 CAD 管线更紧密结合的在线更新机制。
+
+\backmatter
+\chapter*{章节树状目录（建议版）}
+\begin{itemize}
+  \item 第 1 章 引言与论文结构
+  \begin{itemize}
+    \item 1.1 研究背景
+    \item 1.2 问题陈述
+    \item 1.3 本文思路
+    \item 1.4 主要贡献
+    \item 1.5 论文组织结构
+  \end{itemize}
+  \item 第 2 章 基于增强 Nagata 曲面三角形的高阶稀疏窄带符号距离场生成方法
+  \begin{itemize}
+    \item 2.1 问题定义
+    \item 2.2 增强 Nagata 曲面三角形模型
+    \item 2.3 裂隙边检测与共享边界系数构造
+    \item 2.4 约束增强求值与解析导数
+    \item 2.5 基于增强 Nagata 曲面的局部最近点与符号判定
+    \item 2.6 稀疏窄带激活与教师场生成流程
+    \item 2.7 教师场正确性与性能分析
+  \end{itemize}
+  \item 第 3 章 基于增强 Nagata 教师场蒸馏的稀疏窄带神经符号距离场快速生成方法
+  \begin{itemize}
+    \item 3.1 方法动机
+    \item 3.2 问题定义
+    \item 3.3 稀疏局部表示
+    \item 3.4 残差式学生场
+    \item 3.5 训练样本生成
+    \item 3.6 训练目标
+    \item 3.7 推理与回退机制
+    \item 3.8 误差分解
+    \item 3.9 复杂度分析
+  \end{itemize}
+  \item 第 4 章 实验设计与对比方法
+  \begin{itemize}
+    \item 4.1 实验目标
+    \item 4.2 数据集与对象类型
+    \item 4.3 对比方法
+    \item 4.4 评价指标
+    \item 4.5 实验协议
+    \item 4.6 消融实验
+    \item 4.7 预期结果与讨论重点
+  \end{itemize}
+  \item 第 5 章 实验结果
+  \begin{itemize}
+    \item 5.1 GPU 教师场实现与性能
+    \item 5.2 球体解析验证
+    \item 5.3 锐边模型验证
+    \item 5.4 实验汇总表
+  \end{itemize}
+  \item 第 6 章 结论与展望
+\end{itemize}
+
+\end{document}
