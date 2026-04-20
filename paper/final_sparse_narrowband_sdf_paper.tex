@@ -1,0 +1,439 @@
+\documentclass[11pt,a4paper]{ctexart}
+
+\usepackage[a4paper,margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb,amsfonts,bm,mathtools,amsthm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{xcolor}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{siunitx}
+\usepackage{float}
+\usepackage{tikz}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+\newtheorem{definition}{定义}
+\newtheorem{proposition}{命题}
+\newtheorem{remark}{注记}
+\newtheorem{assumption}{假设}
+
+\title{\bfseries 基于增强 Nagata 曲面三角形的\\可查询稀疏窄带符号距离场构建方法}
+\author{作者姓名}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+符号距离场（Signed Distance Field, SDF）是几何处理、接触检测、隐式建模与数值仿真中的基础表示。对于含折痕边、尖锐边与法向不连续边的工程曲面，直接基于平面三角形生成 SDF 虽然实现简单，但几何阶数有限；而将普通 Nagata 曲面直接用于非光滑边区域时，又容易在裂隙边附近出现边界不一致、局部翻转和越界，从而破坏距离场的几何正确性。针对这一问题，本文提出一种基于增强 Nagata 曲面三角形的可查询稀疏窄带 SDF 构建方法。本文首先通过裂隙边检测、共享边界系数构造、Jacobian 正性约束及边界同侧约束，建立适用于非光滑工程曲面的增强 Nagata 几何后端；随后以该增强几何作为离线真值生成器，仅在活跃窄带区域内离散存储局部规则节点格，从而构建块级稀疏窄带 SDF，并在运行时通过块定位与三线性插值实现快速查询。为提升理论完整性，本文进一步给出增强曲面片局部合法性的定义、几何真值 SDF 与离散窄带场的定义，以及由几何真值误差与离散插值误差构成的误差分解框架。最后，通过球面精度验证、非光滑边局部几何验证以及轻量刚体接触算例，验证本文方法在距离精度、法向稳定性与运行时查询效率上的优势。本文方法实现了从增强几何真值生成到可查询稀疏窄带场运行时的统一流程，为含尖锐特征工程曲面的高质量近场 SDF 构建提供了一条可复现路径。
+\end{abstract}
+
+\noindent\textbf{关键词：}Nagata 曲面；折痕边；符号距离场；稀疏窄带；几何查询；接触验证
+
+\section{引言}
+
+符号距离场（Signed Distance Field, SDF）通过为每个空间点赋予到目标曲面的最短距离及其内外符号，提供了一种统一处理几何、拓扑与局部法向信息的隐式表示。SDF 已广泛用于碰撞检测、接触响应、水平集方法、隐式建模、几何优化与可微仿真等任务。对于工程零件、齿轮、叶轮、壳体等具有折痕边、尖锐边及法向跨边不连续特征的对象，如何从分片曲面几何稳定地构造高质量且可直接查询的近场 SDF，仍然是一个具有挑战性的问题。
+
+直接基于平面三角形构造 SDF 具有实现简单、几何定义清晰等优点，但其底层表示仍是分片线性曲面，难以稳定表达高阶局部形状。Nagata 曲面作为一种以顶点法向驱动的局部二次曲面构造，能够在单片内部提供更高阶的几何表达，因此天然适合用作近场真值生成后端。然而，在非光滑边、折痕边和法向不连续边附近，若相邻三角形分别依据各自单侧法向独立构造普通 Nagata 曲面，则共享边两侧可能给出彼此不一致的边界曲线，进而导致裂隙、局部翻转和越界。此类问题不仅会污染最近点和法向计算，还会直接破坏由其生成的 SDF 真值。
+
+另一方面，在工程实现层面，几何真值生成、样本导出、场表示和运行时查询常被混合在一起，导致系统主线不清。对于本文所关注的问题，最终需要的并不是中间样本集合，也不是额外的拟合器，而是一个\emph{可直接查询}的稀疏窄带 SDF 结构。也就是说，增强几何后端应当负责离线真值生成，而运行时则应当通过块级稀疏场表示直接进行快速查询。
+
+基于以上考虑，本文提出一种基于增强 Nagata 曲面三角形的可查询稀疏窄带符号距离场构建方法。本文的核心思路是：先通过裂隙边检测、共享边界系数 $c_{\mathrm{sharp}}$ 构造以及 Jacobian 正性与边界同侧约束，建立适用于非光滑边对象的增强 Nagata 几何后端；再仅在活跃窄带块内离散存储局部规则节点格，将增强几何真值离散为可直接查询的块级稀疏 SDF；最后在运行时通过块定位与三线性插值实现高效查询，从而明确区分离线几何真值生成与在线场查询两个阶段。
+
+本文的主要贡献如下：
+\begin{enumerate}[leftmargin=2em]
+    \item 提出一种面向折痕边、尖锐边和法向不连续边的增强 Nagata 曲面三角形构造方法。该方法通过裂隙边检测、共享边界系数构造、Jacobian 正性约束及边界同侧约束，抑制普通 Nagata 曲面在非光滑边附近的边界不一致、局部翻转与越界问题。
+    \item 提出一种基于增强 Nagata 几何后端的稀疏窄带 SDF 构建方法。该方法仅在活跃窄带块内存储局部节点格，将昂贵的最近点求解限制在离线构建阶段，并在运行时通过三线性插值实现直接查询。
+    \item 从理论上给出增强曲面片局部合法性、几何真值 SDF、离散窄带场及其误差分解框架，并从工程上实现从 NSM 输入、ENG 缓存、增强几何真值生成到可查询稀疏窄带 SDF 构建与查询的完整链条。
+\end{enumerate}
+
+\section{相关工作}
+
+\subsection{三角网格上的符号距离场构造}
+基于三角网格构造 SDF 是几何处理与数值仿真中的经典问题。典型方法通常直接对平面三角形进行最近点查询，并结合射线奇偶性、绕数或法向一致性判定内外符号。这类方法结构清晰，但在曲率较大区域或高精度近场应用中容易受到分片线性表示限制。
+
+\subsection{高阶局部曲面与 Nagata 曲面}
+Nagata 曲面通过顶点坐标与顶点法向构造局部二次曲面片，在保持局部表示紧凑的同时提供了高于平面三角形的几何表达能力。其优势在于单片内部求值和导数计算较为简洁，适合作为近场真值生成后端。然而，普通 Nagata 曲面默认假设跨边法向延拓的一致性，在折痕边和法向不连续边附近会出现共享边界曲线不一致等问题，因此需要针对非光滑边做额外增强。
+
+\subsection{稀疏窄带场表示}
+对于接触检测、近场约束求解和高频查询任务，通常只需在零水平附近保留窄带场值。相比全域稠密体素，稀疏窄带表示能够显著降低内存占用和构建代价。典型思路包括八叉树、哈希体、稀疏块和局部规则格等。本文采用块级稀疏窄带结构，以保持实现清晰与运行时查询的直接性。
+
+\section{预备知识与问题定义}
+
+\subsection{输入、输出与符号约定}
+设输入为 NSM（Nagata Surface Mesh）格式的闭合三角网格
+\[
+\mathcal{M}=(V,F,N),
+\]
+其中 $V=\{x_i\}$ 为顶点集合，$F=\{f_j\}$ 为三角形集合，$N$ 为每个三角形三个顶点的法向数据。对每个三角形片 $f_j$，本文进一步构造增强 Nagata 曲面片
+\[
+\mathcal{P}_j^{\mathrm{enh}}.
+\]
+
+给定窄带半宽 $\tau>0$，本文目标是在感兴趣区域内构建一个可直接查询的稀疏窄带 SDF：
+\[
+\phi_\tau: \Omega_\tau\rightarrow[-\tau,\tau],
+\qquad
+\Omega_\tau=\{x\in\mathbb{R}^3\mid |\phi(x)|\le \tau\}.
+\]
+
+最终输出不是样本集合，而是由活跃块坐标、局部规则节点格和三线性查询机制组成的块级稀疏 SDF 结构。
+
+\subsection{普通 Nagata 曲面与非光滑边失效模式}
+对给定三角形顶点 $x_{00},x_{10},x_{11}$ 及对应曲率系数 $c_1,c_2,c_3$，普通 Nagata 曲面可写为
+\begin{equation}
+S^{\mathrm{raw}}(u,v)=x_{00}(1-u)+x_{10}(u-v)+x_{11}v-c_1(1-u)(u-v)-c_2(u-v)v-c_3(1-u)v,
+\label{eq:nagata_raw}
+\end{equation}
+其中参数域满足
+\[
+u,v\in[0,1],\qquad v\le u.
+\]
+
+式 \eqref{eq:nagata_raw} 在单片内部可给出连续的位置与导数，但在法向跨边不连续的共享边附近，相邻两片若依据各自单侧法向独立构造，则会出现三类失效模式：
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{共享边界不一致}：同一共享边对应两条不同的二次边界曲线；
+    \item \textbf{局部翻转}：参数化的面积元素变号，即 Jacobian 失正；
+    \item \textbf{边界越界}：曲面片跨越到共享边错误一侧。
+\end{enumerate}
+
+本文的增强构造正是围绕上述三类失效模式展开。
+
+\subsection{总体流程}
+本文方法包含如下四个阶段：
+\begin{enumerate}[leftmargin=2em]
+    \item 读取 NSM，并加载或重建 ENG 缓存中的增强几何参数；
+    \item 对普通 Nagata 曲面进行非光滑边增强，得到增强 Nagata 几何后端；
+    \item 基于增强几何后端，在活跃窄带块内构建块级稀疏窄带 SDF；
+    \item 运行时通过块定位与三线性插值进行 SDF 查询。
+\end{enumerate}
+数据流可简记为：
+\[
+\text{NSM/ENG}\rightarrow \text{Enhanced Nagata Backend}\rightarrow \text{Sparse Narrow-Band SDF}\rightarrow \text{Query}.
+\]
+
+\section{增强 Nagata 曲面三角形几何后端}
+
+\subsection{裂隙边检测与共享边界系数构造}
+为识别普通 Nagata 在非光滑边上的失效区域，本文首先遍历所有由两个三角形共享的内部边。对每条共享边，分别利用左右两侧法向构造其对应的 Nagata 边界曲线，并在多点采样下比较边界偏差。若最大偏差超过阈值，则将该边标记为裂隙边，并记裂隙边集合为
+\[
+\mathcal{E}_{\mathrm{cr}}.
+\]
+
+对于每条裂隙边，本文利用两侧法向计算端点折痕方向，并通过最小二乘形式求解共享边界系数
+\[
+c_{\mathrm{sharp}}.
+\]
+其目的不是强行使跨边法向连续，而是在保留折痕特征的前提下，使两侧曲面片在共享边界上使用一致的二次边界表达，从而消除由双侧独立延拓造成的几何裂隙。
+
+\subsection{约束增强求值}
+在增强求值阶段，本文采用结构化补偿形式对普通 Nagata 曲面做修正。记原始边界系数为 $c_{\mathrm{orig}}$，共享边界系数为 $c_{\mathrm{sharp}}$，则使用高斯衰减构造有效系数
+\begin{equation}
+c_{\mathrm{eff}}=c_{\mathrm{orig}}+\big(c_{\mathrm{sharp}}-c_{\mathrm{orig}}\big)\exp(-k d^2),
+\label{eq:ceff_final}
+\end{equation}
+其中 $d$ 为到对应边的距离，$k$ 为衰减控制参数。于是增强曲面记为
+\[
+S^{\mathrm{enh}}(u,v; c_{\mathrm{eff}}).
+\]
+
+\subsection{曲面片局部合法性}
+为了使增强曲面不仅在共享边上连续，而且在片内保持几何合法性，本文在系数筛选和求值阶段同时施加两个约束。
+
+\paragraph{Jacobian 正性约束}
+设曲面一阶导数为 $\partial_u S,\partial_v S$，参考法向为 $n_{\mathrm{ref}}$，定义有向 Jacobian 为
+\begin{equation}
+J(u,v)=\big(\partial_u S \times \partial_v S\big)\cdot n_{\mathrm{ref}}.
+\label{eq:jacobian_final}
+\end{equation}
+要求在感兴趣参数域内满足
+\[
+J(u,v)>0.
+\]
+该约束用于防止参数化局部翻转。
+
+\paragraph{边界同侧约束}
+设 $x_{\mathrm{edge}}$ 为共享边上的参考边界点，$n_{\mathrm{side}}$ 为边界侧向单位向量，则要求
+\begin{equation}
+\big(S^{\mathrm{enh}}(u,v)-x_{\mathrm{edge}}\big)\cdot n_{\mathrm{side}}\ge -\varepsilon,
+\label{eq:sameside_final}
+\end{equation}
+其中 $\varepsilon>0$ 为数值容差。该约束用于抑制增强曲面穿越到错误一侧。
+
+\begin{definition}[局部几何合法性]
+对于增强曲面片 $\mathcal{P}^{\mathrm{enh}}_j$，若其在感兴趣参数域内满足：
+\begin{enumerate}[leftmargin=2em]
+    \item 与相邻片在裂隙边上共享一致边界；
+    \item Jacobian 正性，即式 \eqref{eq:jacobian_final} 成立；
+    \item 边界同侧约束，即式 \eqref{eq:sameside_final} 成立，
+\end{enumerate}
+则称该曲面片在该参数域内是\textbf{局部几何合法}的。
+\end{definition}
+
+\begin{proposition}[增强构造对非光滑边失效模式的抑制]
+在裂隙边上，若共享边界系数通过双侧约束筛选得到，并且求值阶段强制执行 Jacobian 正性与边界同侧保护，则增强曲面片在共享边邻域内能够抑制普通 Nagata 独立延拓带来的边界不一致、局部翻转和跨边越界现象。
+\end{proposition}
+
+\begin{remark}
+该命题的意义不在于声称全局严格光滑，而在于明确：对于法向不连续边，增强项不是对正确曲面的附加修补，而是使局部曲面定义成立的必要组成。换言之，普通 Nagata 在这类边上定义并不充分，增强构造给出了适用于非光滑边场景的局部几何合法延拓。
+\end{remark}
+
+\section{几何真值 SDF 与稀疏窄带离散场}
+
+\subsection{增强几何并集与真值 SDF}
+记所有增强曲面片的并集为
+\[
+\Gamma^{\mathrm{enh}}=\bigcup_j \mathcal{P}^{\mathrm{enh}}_j.
+\]
+对于任意点 $x\in\mathbb{R}^3$，定义其到增强几何并集的无符号距离为
+\begin{equation}
+d^{\star}(x)=\min_{y\in\Gamma^{\mathrm{enh}}}\|x-y\|.
+\label{eq:unsigned_true}
+\end{equation}
+
+设最近点为
+\[
+y^{\star}(x)=\arg\min_{y\in\Gamma^{\mathrm{enh}}}\|x-y\|,
+\]
+对应最近点法向为 $n^{\star}(x)$，则局部符号可定义为
+\begin{equation}
+s^{\star}(x)=\operatorname{sign}\big((x-y^{\star}(x))\cdot n^{\star}(x)\big).
+\label{eq:sign_true}
+\end{equation}
+从而几何真值 SDF 为
+\begin{equation}
+\phi^{\star}(x)=s^{\star}(x)\,d^{\star}(x).
+\label{eq:true_sdf}
+\end{equation}
+
+\begin{definition}[几何真值 SDF]
+由增强几何并集 $\Gamma^{\mathrm{enh}}$ 通过式 \eqref{eq:unsigned_true}--\eqref{eq:true_sdf} 诱导得到的有符号距离函数 $\phi^{\star}$，称为本文的\textbf{几何真值 SDF}。
+\end{definition}
+
+本文只关注窄带区域，因此使用截断形式
+\begin{equation}
+\phi^{\star}_{\tau}(x)=\mathrm{clip}(\phi^{\star}(x),-\tau,\tau).
+\label{eq:true_trunc_sdf}
+\end{equation}
+
+\subsection{活跃块与离散窄带场}
+为避免全域稠密体素化，本文采用块级稀疏表示。设背景块边长为 $h_b$。对每个增强曲面片估计其轴对齐包围盒，并向外扩张窄带半宽 $\tau$。所有与扩张包围盒相交的块被标记为活跃块，记其集合为
+\[
+\mathcal{B}_{\mathrm{act}}.
+\]
+
+对于每个活跃块 $B_k\in\mathcal{B}_{\mathrm{act}}$，设块内每轴使用 $R$ 个体素单元，则在块内建立一个 $(R+1)^3$ 的规则节点格。对每个节点位置 $x_{k,i,j,\ell}$，定义节点值为
+\begin{equation}
+\Phi_k(i,j,\ell)=\phi^{\star}_{\tau}(x_{k,i,j,\ell}),
+\qquad 0\le i,j,\ell\le R.
+\label{eq:block_nodes}
+\end{equation}
+
+\begin{definition}[稀疏窄带离散场]
+由活跃块集合 $\mathcal{B}_{\mathrm{act}}$、每个块的局部节点张量
+\[
+\Phi_k\in\mathbb{R}^{(R+1)\times(R+1)\times(R+1)}
+\]
+及相关元信息 $(\tau,h_b,R)$ 所组成的结构，称为\textbf{稀疏窄带离散场}。
+\end{definition}
+
+\subsection{运行时查询}
+给定任意查询点 $x$，运行时首先判断其是否落入某个活跃块；若不在活跃块内，则视为窄带外点；若在某个活跃块 $B_k$ 内，则将其映射到块内局部坐标，并在 $\Phi_k$ 上执行三线性插值：
+\begin{equation}
+\hat{\phi}_{\tau}(x)=\mathcal{I}_h\big[\Phi_k\big](x),
+\label{eq:query_interp}
+\end{equation}
+其中 $\mathcal{I}_h$ 表示与块尺寸 $h_b$ 对应的三线性插值算子。
+
+\begin{proposition}[离线真值生成与在线场查询的职责分离]
+若局部节点格存储的是几何真值截断 SDF 在节点处的采样值，则运行时查询不再依赖增强几何最近点优化，而仅依赖活跃块定位与局部插值。
+\end{proposition}
+
+该命题明确了本文系统中两类查询的区别：增强几何后端负责\emph{离线真值生成}，块级稀疏窄带结构负责\emph{在线场查询}。
+
+\section{误差分解与复杂度分析}
+
+\subsection{误差来源分解}
+本文最终运行时输出的是式 \eqref{eq:query_interp} 所定义的离散场查询值，而几何真值为式 \eqref{eq:true_trunc_sdf}。因此，对任意落在活跃块中的查询点 $x$，有
+\begin{equation}
+|\hat{\phi}_{\tau}(x)-\phi^{\star}_{\tau}(x)|
+\le
+|\hat{\phi}_{\tau}(x)-\mathcal{I}_h[\phi^{\star}_{\tau}](x)|
++
+|\mathcal{I}_h[\phi^{\star}_{\tau}](x)-\phi^{\star}_{\tau}(x)|.
+\label{eq:error_split}
+\end{equation}
+
+式 \eqref{eq:error_split} 中两项分别对应：
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{实现误差}：包括节点值构建时的数值最近点求解误差、有限容差引入的误差，以及软件实现中的数值近似；
+    \item \textbf{离散插值误差}：由块分辨率 $R$、块边长 $h_b$ 及局部场值变化率决定。
+\end{enumerate}
+
+\begin{remark}
+式 \eqref{eq:error_split} 的意义在于明确：本文方法的最终误差并不只是“几何误差”，而是由增强几何真值生成误差和块级离散插值误差共同组成。因而在实验中既需要评估增强几何后端的局部正确性，也需要评估块分辨率与窄带宽度对查询精度的影响。
+\end{remark}
+
+\subsection{复杂度讨论}
+设活跃块数为 $M$，每个块每轴分辨率为 $R$，则总节点数约为
+\[
+N_{\mathrm{node}} = M(R+1)^3.
+\]
+构建阶段需要对这些节点逐点调用增强几何后端进行最近点与符号计算，因此主要代价集中在离线阶段。运行时单点查询则退化为：
+\begin{enumerate}[leftmargin=2em]
+    \item 块定位；
+    \item 读取局部 $(R+1)^3$ 节点格中的相邻 8 个节点值；
+    \item 三线性插值。
+\end{enumerate}
+因此运行时复杂度远低于几何真值生成，且不再随候选曲面片数量增长。
+
+\section{实现细节与系统组织}
+
+\subsection{输入与缓存机制}
+本文实现以 NSM 文件为几何输入格式，NSM 中包含顶点坐标、三角形索引、面片编号及三角形顶点法向。对增强几何相关的裂隙边修正参数，使用独立的 ENG 文件进行持久化缓存。这样，当几何输入不变时，可直接复用已有的 $c_{\mathrm{sharp}}$ 数据，避免重复构造增强边界系数。
+
+\subsection{系统模块}
+根据最终系统职责，本文实现被组织为以下模块：
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{增强几何后端}：负责 NSM 读取、ENG 缓存、裂隙边检测、共享边界系数构造及最近点查询；
+    \item \textbf{稀疏窄带构建器}：负责活跃块枚举、局部规则节点格采样与块级 SDF 存储；
+    \item \textbf{运行时查询器}：负责从块级窄带场中进行三线性插值查询；
+    \item \textbf{验证与可视化工具}：用于球面精度验证、局部误差可视化及接触验证实验。
+\end{enumerate}
+
+\section{实验设计}
+
+\subsection{实验目标}
+实验主要回答以下三个问题：
+\begin{enumerate}[leftmargin=2em]
+    \item 增强 Nagata 几何后端是否能够在非光滑边附近提供更稳定的几何真值？
+    \item 基于增强几何构建的稀疏窄带 SDF 是否具有足够的近场精度？
+    \item 与直接几何查询相比，稀疏窄带 SDF 是否在运行时查询上具有明显优势？
+\end{enumerate}
+
+\subsection{对比方法}
+本文至少比较以下三种方法：
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{Linear-Tri SDF}：基于平面三角形的 SDF；
+    \item \textbf{Raw Nagata SDF}：基于普通 Nagata 曲面的 SDF；
+    \item \textbf{Enhanced Nagata Sparse NB-SDF}：本文方法。
+\end{itemize}
+
+\subsection{评价指标}
+对近场点集 $\mathcal{Q}$，定义距离误差指标：
+\begin{align}
+E_{\mathrm{mean}} &= \frac{1}{|\mathcal{Q}|}\sum_{x\in\mathcal{Q}} |\phi(x)-\phi^{\mathrm{ref}}(x)|,\\
+E_{\max} &= \max_{x\in\mathcal{Q}} |\phi(x)-\phi^{\mathrm{ref}}(x)|,\\
+E_{\mathrm{rms}} &= \left(\frac{1}{|\mathcal{Q}|}\sum_{x\in\mathcal{Q}} |\phi(x)-\phi^{\mathrm{ref}}(x)|^2\right)^{1/2}.
+\end{align}
+
+法向误差定义为
+\begin{equation}
+e_n(x)=\arccos\big(n(x)\cdot n^{\mathrm{ref}}(x)\big).
+\end{equation}
+
+此外，记录如下效率指标：
+\begin{itemize}[leftmargin=2em]
+    \item 构建时间；
+    \item 单点查询时间；
+    \item 批量查询吞吐量；
+    \item 内存占用。
+\end{itemize}
+
+\section{算例设计}
+
+\subsection{球面精度验证}
+球面算例用于验证几何真值生成与稀疏窄带 SDF 查询的基础正确性。由于球面解析 SDF 已知，可直接使用
+\[
+\phi^{\mathrm{ref}}(x)=\|x-c\|-r
+\]
+作为参考真值，其中 $c$ 为球心，$r$ 为半径。
+
+本算例主要考察：
+\begin{enumerate}[leftmargin=2em]
+    \item 稀疏窄带 SDF 相对于解析球面 SDF 的误差；
+    \item 不同块分辨率和窄带半宽对误差的影响；
+    \item 构建完成后的运行时查询效率。
+\end{enumerate}
+
+\subsection{非光滑边局部几何验证}
+选取含尖锐边或折痕边的模型，在裂隙边附近构造局部采样点，对比 Raw Nagata 与增强 Nagata 的：
+\begin{itemize}[leftmargin=2em]
+    \item 边界偏差；
+    \item Jacobian 非正比例；
+    \item 局部越界比例；
+    \item 最近点法向误差。
+\end{itemize}
+该实验用于直接证明增强几何后端的必要性。
+
+\subsection{轻量刚体接触算例}
+为了验证本文方法在后端应用中的价值，设计一个轻量刚体接触算例。场景可采用带尖锐边楔块与平面的准静态接触，或简化齿块接触。设刚体 $A$ 以固定小步长沿接触法向逐步靠近刚体 $B$，对每一推进步，基于 SDF 计算接触穿透深度与接触法向。
+
+采用简单 penalty 接触模型：
+\begin{equation}
+E_c(x)=\frac{k_c}{2}\max(0,-\phi(x))^2,
+\end{equation}
+其法向接触力为
+\begin{equation}
+f_c(x)= -k_c \max(0,-\phi(x))\, n(x).
+\end{equation}
+
+该算例主要统计如下指标：
+\begin{itemize}[leftmargin=2em]
+    \item 接触区域距离误差；
+    \item 接触法向误差；
+    \item 相邻步接触力抖动：
+    \[
+    J_f=\frac{1}{N-1}\sum_{t=1}^{N-1}\|f_{t+1}-f_t\|;
+    \]
+    \item 接触点轨迹连续性；
+    \item 运行时查询代价。
+\end{itemize}
+
+该实验的目标不是提出新的动力学求解器，而是证明本文构建的稀疏窄带 SDF 在非光滑边场景下能够提供更稳定的接触后端。
+
+\section{结果分析模板}
+
+为方便后续补实验结果，建议论文结果部分按照如下结构组织。
+
+\subsection{几何正确性}
+比较 Linear-Tri、Raw Nagata 与本文方法在折痕边附近的局部误差分布，展示增强几何后端对裂隙、翻转与越界的抑制作用。
+
+\subsection{球面精度}
+报告球面解析 SDF 上的 $E_{\mathrm{mean}}$、$E_{\max}$、$E_{\mathrm{rms}}$ 以及不同块分辨率下的查询性能。
+
+\subsection{接触验证}
+通过接触力曲线、法向误差曲线和接触点轨迹图，展示本文方法在接触响应稳定性上的优势。
+
+\subsection{效率}
+报告构建时间、单点查询时间和批量吞吐量，说明将昂贵的几何真值生成限制在离线阶段后，运行时查询能够显著提速。
+
+\section{结论与展望}
+
+本文提出一种基于增强 Nagata 曲面三角形的可查询稀疏窄带符号距离场构建方法。与普通 Nagata 曲面相比，本文在非光滑边上引入裂隙边检测、共享边界系数构造、Jacobian 正性与边界同侧约束，从而建立了适用于折痕边和法向不连续边对象的增强几何真值后端。在此基础上，进一步构建块级稀疏窄带 SDF，仅在活跃块内存储局部规则节点格，并通过三线性插值实现运行时直接查询。该方法明确区分了离线几何真值生成与在线场查询两个阶段，为含尖锐特征工程曲面的高质量近场 SDF 构建提供了一条清晰的实现路径。
+
+未来工作可从以下三个方向展开：其一，进一步提升增强几何后端的批量构建效率与 GPU 并行能力；其二，引入更鲁棒的全局符号判定与块级自适应分辨率机制；其三，将本文构建的稀疏窄带 SDF 更系统地用于接触仿真、优化迭代与多体动力学场景。
+
+\section*{参考文献（占位）}
+
+\begin{enumerate}[leftmargin=2em]
+    \item Nagata T. Simple local interpolation of surfaces using normal vectors. Computer Aided Geometric Design, 2005.
+    \item [待补充] 稀疏窄带 SDF / 截断 SDF / 稀疏体素表示相关文献。
+    \item [待补充] 工程接触与基于 SDF 的碰撞检测相关文献。
+    \item [待补充] 高阶曲面、法向驱动插值及非光滑边处理相关文献。
+\end{enumerate}
+
+\end{document}
